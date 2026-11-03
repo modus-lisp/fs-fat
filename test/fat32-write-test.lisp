@@ -63,9 +63,40 @@
       (ensure-directories-exist path)
       (wt-write path (cdr f)))))
 
+(defvar *write-block* nil
+  "When true, the workload runs on a BLOCK device over the image file: reads and writes
+   go straight to the file, whole 512-byte sectors at a time, as a card driver does.")
+
+(defun wt-block-volume (stream)
+  "A volume on a block device over STREAM, the image, with sector-granular I/O."
+  (labels ((sector (lba)
+             (let ((b (make-array 512 :element-type '(unsigned-byte 8))))
+               (file-position stream (* lba 512))
+               (read-sequence b stream)
+               b))
+           (rd (off n)
+             (let ((out (make-array n :element-type '(unsigned-byte 8))) (pos 0))
+               (loop while (< pos n) do
+                 (let* ((at (+ off pos)) (lba (floor at 512)) (o (mod at 512))
+                        (take (min (- 512 o) (- n pos))))
+                   (replace out (sector lba) :start1 pos :start2 o :end2 (+ o take))
+                   (incf pos take)))
+               out))
+           (wr (off src)
+             (let* ((lba (floor off 512)) (b (sector lba)))
+               (replace b src :start1 (mod off 512))
+               (file-position stream (* lba 512))
+               (write-sequence b stream))))
+    (fat32-open-device
+     (make-fat32-block-device (file-length stream) #'rd #'wr
+                              (lambda () (finish-output stream))))))
+
 (defun wt-main ()
-  (let* ((bytes (wt-read *write-image*))
-         (*wt-v* (fat32-open bytes)))
+  (let* ((stream (and *write-block*
+                      (open *write-image* :direction :io :element-type '(unsigned-byte 8)
+                                          :if-exists :overwrite)))
+         (bytes (if stream nil (wt-read *write-image*)))
+         (*wt-v* (if stream (wt-block-volume stream) (fat32-open bytes))))
     (wt-mkdir "many")
     (dotimes (i 300)
       (let ((name (format nil "many/file-~3,'0d-with-a-longer-name.dat" (+ i 1))))
@@ -94,7 +125,9 @@
     (wt-rm "sub/deeper/x.txt")
     (wt-rmdir "sub/deeper")
     (wt-rmdir "sub")
-    (wt-write *write-image* bytes)
+    (if stream
+        (progn (fat32-sync *wt-v*) (close stream))
+        (wt-write *write-image* bytes))
     (wt-write-mirror)
     (format t "WRITE-DONE~%")))
 

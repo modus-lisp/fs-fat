@@ -2,6 +2,7 @@
 # run-fat32-write.sh -- lib/fat32.lisp writes, checked by fsck.fat and mtools.
 #
 #   test/run-fat32-write.sh [SIZE_KIB]     (default 40960: one cluster per sector)
+#   BLOCK=1 test/run-fat32-write.sh        the same on a block device (sector I/O on the file)
 #
 # test/fat32-write-test.lisp writes a workload through the library, and into a host
 # mirror in step.  Then fsck.fat must accept the image, and an mtools export of the
@@ -33,6 +34,7 @@ cat > "$WORK/run.lisp" <<EOF2
 (defvar *write-lib* "$ROOT/lib/fat32.lisp")
 (defvar *write-image* "$IMG")
 (defvar *write-mirror* "$MIRROR")
+(defvar *write-block* ${BLOCK:+t})
 (load "$ROOT/test/fat32-write-test.lisp")
 EOF2
 

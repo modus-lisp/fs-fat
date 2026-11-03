@@ -50,7 +50,8 @@
   (:export #:fat32-open #:fat32-open-device #:fat32-lookup #:fat32-directory
            #:fat32-read-file #:fat32-write-file #:fat32-mkdir #:fat32-delete
            #:fat32-rename #:fat32-sync
-           #:make-fat32-device #:device-read #:device-write #:device-flush
+           #:make-fat32-device #:make-fat32-block-device #:device-size
+           #:device-read #:device-write #:device-flush
            #:device-crash-writes #:device-dead-p #:device-events
            #:exfat-open #:exfat-lookup #:exfat-directory #:exfat-read-file
            #:exfat-write-file #:exfat-mkdir #:exfat-delete #:exfat-rename
@@ -114,8 +115,9 @@
 
 (defun fat32-open (bytes &optional device)
   "A volume over BYTES.  DEVICE, when given, is the disk BYTES is the view of: writes
-   then go through the device, and barriers flush it (see the devices section)."
-  (let ((len (length bytes)))
+   then go through the device, and barriers flush it (see the devices section).  For a
+   block device BYTES need only hold the boot sector."
+  (let ((len (if device (device-size device) (length bytes))))
     (when (< len 512)
       (error "fat32: volume is ~a bytes, too short for a boot sector" len))
     (unless (and (= (%fat-u8 bytes 510) #x55) (= (%fat-u8 bytes 511) #xAA))
@@ -452,20 +454,39 @@
 ;;;   real image follows the view; FLUSH-FN, when set, is called with no arguments at
 ;;;   each flush and must make the writes so far durable.  Both are NIL for a memory
 ;;;   device.
+;;;
+;;; A BLOCK device has no view: a disk too big to hold in memory, such as an SD card.
+;;; Its slots are #(NIL NIL NIL EVENTS CRASH-AT DEAD WRITE-FN FLUSH-FN READ-FN SIZE).
+;;; Reads go to READ-FN, called as (READ-FN OFFSET N) for a fresh vector of N bytes;
+;;; writes go to WRITE-FN alone, and nothing is logged, so it has no crash simulation.
+;;; A write lies within one sector but may cover only part of it: a disk that writes
+;;; whole sectors must read the rest of the sector and write it back.
 
 (defun make-fat32-device (view &optional write-fn flush-fn)
   "A device whose view is VIEW, which it modifies in place."
-  (vector view nil nil 0 nil nil write-fn flush-fn))
+  (vector view nil nil 0 nil nil write-fn flush-fn nil nil))
+
+(defun make-fat32-block-device (size read-fn &optional write-fn flush-fn)
+  "A device of SIZE bytes read through READ-FN and written through WRITE-FN, with no copy
+   of its contents in memory.  Without WRITE-FN it is read-only: a write signals."
+  (vector nil nil nil 0 nil nil write-fn flush-fn read-fn size))
+
+(defun %device-block-p (dev) (null (svref dev 0)))
+
+(defun device-size (dev)
+  "The device's size in bytes."
+  (if (%device-block-p dev) (svref dev 9) (length (svref dev 0))))
 
 (defun fat32-open-device (dev)
-  (fat32-open (svref dev 0) dev))
+  (fat32-open (if (%device-block-p dev) (device-read dev 0 512) (svref dev 0)) dev))
 
 (defun device-read (dev off n)
   "N bytes at OFF of the view, as a fresh vector."
-  (let ((view (svref dev 0)))
-    (when (or (< off 0) (> (+ off n) (length view)))
-      (error "fat32: read past end of volume at byte ~a" (+ off n)))
-    (subseq view off (+ off n))))
+  (when (or (< off 0) (> (+ off n) (device-size dev)))
+    (error "fat32: read past end of volume at byte ~a" (+ off n)))
+  (if (%device-block-p dev)
+      (funcall (svref dev 8) off n)
+      (subseq (svref dev 0) off (+ off n))))
 
 (defun device-dead-p (dev) (svref dev 5))
 
@@ -478,10 +499,14 @@
       (setf (svref dev 5) t)
       (return-from device-write nil))
     (setf (svref dev 3) (+ (svref dev 3) 1))
-    (push (cons off (copy-seq src)) (svref dev 2))
-    (%fat-copy-into (svref dev 0) off src)
-    (when (svref dev 6)
-      (funcall (svref dev 6) off src))))
+    (cond ((%device-block-p dev)
+           (unless (svref dev 6) (error "fat32: the device is read-only"))
+           (funcall (svref dev 6) off src))
+          (t
+           (push (cons off (copy-seq src)) (svref dev 2))
+           (%fat-copy-into (svref dev 0) off src)
+           (when (svref dev 6)
+             (funcall (svref dev 6) off src))))))
 
 (defun device-flush (dev)
   "Everything written so far becomes durable."
@@ -490,8 +515,9 @@
       (setf (svref dev 5) t)
       (return-from device-flush nil))
     (setf (svref dev 3) (+ (svref dev 3) 1))
-    (setf (svref dev 1) (append (svref dev 2) (svref dev 1)))
-    (setf (svref dev 2) nil)
+    (unless (%device-block-p dev)
+      (setf (svref dev 1) (append (svref dev 2) (svref dev 1)))
+      (setf (svref dev 2) nil))
     (when (svref dev 7)
       (funcall (svref dev 7)))))
 
