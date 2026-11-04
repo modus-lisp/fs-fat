@@ -49,7 +49,7 @@
   (:use #:cl)
   (:export #:fat32-open #:fat32-open-device #:fat32-lookup #:fat32-directory
            #:fat32-read-file #:fat32-write-file #:fat32-mkdir #:fat32-delete
-           #:fat32-rename #:fat32-sync
+           #:fat32-rename #:fat32-sync #:fat32-format
            #:make-fat32-device #:make-fat32-block-device #:device-size
            #:device-read #:device-write #:device-flush
            #:device-crash-writes #:device-dead-p #:device-events
@@ -60,7 +60,7 @@
 (in-package #:fs-fat)
 
 ;; Used before their definitions below, so a source LOAD does not warn about them.
-(declaim (ftype function device-read %fat-copy-into))
+(declaim (ftype function device-read device-size %fat-copy-into))
 
 (defun %fat-u8 (bytes off)
   (when (or (< off 0) (>= off (length bytes)))
@@ -1041,3 +1041,86 @@
                       for s in saved
                       do (%fat-write v (%fat-slot-offset v oclusters i) s)))))
           nil)))))
+
+;;; ---- formatting ----------------------------------------------------------------------
+;;; FAT32-FORMAT makes an empty FAT32 volume on a device: what mkfs.vfat -F 32 writes, by
+;;; Microsoft's FAT specification (cluster size by volume size, the FAT32 FAT-size formula,
+;;; FSInfo and a backup boot sector at 6).  Every sector the volume's structures cover is
+;;; written -- the reserved area, both FATs, the root cluster -- since a card's old contents
+;;; are not zeros.  The boot sector goes LAST, after a flush: a format cut off part way leaves
+;;; no signature, so nothing mistakes the half-written area for a volume.
+
+(defun %fat32-cluster-sectors (total-sectors)
+  "Sectors per cluster for a volume of TOTAL-SECTORS 512-byte sectors (the specification's
+   table: 4 KB clusters to 8 GB, then 8, 16, 32 KB)."
+  (cond ((<= total-sectors 532480) 1)          ; 260 MB
+        ((<= total-sectors 16777216) 8)        ; 8 GB
+        ((<= total-sectors 33554432) 16)       ; 16 GB
+        ((<= total-sectors 67108864) 32)       ; 32 GB
+        (t 64)))
+
+(defun fat32-format (dev &key (label "NO NAME") sectors-per-cluster (volume-id 0) (hidden-sectors 0))
+  "Make an empty FAT32 volume of the whole of DEV (512-byte sectors).  LABEL is up to 11
+   characters; HIDDEN-SECTORS is the partition's first sector on its disk (the BPB records it).
+   Returns the open volume."
+  (let* ((bps 512)
+         (total (floor (device-size dev) bps))
+         (spc (or sectors-per-cluster (%fat32-cluster-sectors total)))
+         (rsvd 32) (nfats 2)
+         ;; the specification's FAT32 sizing: FAT sectors enough for the clusters left after them
+         (fatsz (ceiling (- total rsvd) (floor (+ (* 256 spc) nfats) 2)))
+         (data-start (+ rsvd (* nfats fatsz)))
+         (nclusters (floor (- total data-start) spc))
+         (zero (make-array bps :initial-element 0)))
+    (unless (and (> spc 0) (<= spc 128) (= 0 (logand spc (- spc 1))))
+      (error "fat32-format: sectors per cluster ~a is not a power of two up to 128" spc))
+    (when (< nclusters 65525)
+      (error "fat32-format: ~a sectors make ~a clusters of ~a sectors; FAT32 needs at least 65525"
+             total nclusters spc))
+    (flet ((put (sector bytes) (device-write dev (* sector bps) bytes))
+           (le (bytes off n value) (%fat-put bytes off n value))
+           (ascii (bytes off string n)
+             (dotimes (i n)
+               (setf (aref bytes (+ off i))
+                     (if (< i (length string)) (char-code (char-upcase (char string i))) 32)))))
+      ;; the reserved area, both FATs and the root cluster: zeros
+      (dotimes (s rsvd) (put s zero))
+      (dotimes (s (* nfats fatsz)) (put (+ rsvd s) zero))
+      (dotimes (s spc) (put (+ data-start s) zero))
+      ;; FAT[0] the media byte, FAT[1] end of chain, FAT[2] the root directory's one cluster
+      (let ((f (make-array bps :initial-element 0)))
+        (le f 0 4 #x0FFFFFF8) (le f 4 4 #x0FFFFFFF) (le f 8 4 #x0FFFFFFF)
+        (dotimes (i nfats) (put (+ rsvd (* i fatsz)) f)))
+      ;; the volume label as the root directory's first entry
+      (when (and label (string/= label "NO NAME"))
+        (let ((d (make-array bps :initial-element 0)))
+          (ascii d 0 label 11)
+          (setf (aref d 11) #x08)
+          (put data-start d)))
+      ;; FSInfo, and its backup at 7: every cluster but the root's free, the next from 3
+      (let ((fi (make-array bps :initial-element 0)))
+        (le fi 0 4 #x41615252) (le fi 484 4 #x61417272)
+        (le fi 488 4 (- nclusters 1)) (le fi 492 4 3)
+        (le fi 508 4 #xAA550000)
+        (put 1 fi) (put 7 fi))
+      (device-flush dev)
+      ;; the boot sector: its backup at 6 first, then sector 0, the signature last of all
+      (let ((b (make-array bps :initial-element 0)))
+        (setf (aref b 0) #xEB (aref b 1) #x58 (aref b 2) #x90)
+        (ascii b 3 "MODUS" 8)
+        (le b 11 2 bps) (setf (aref b 13) spc) (le b 14 2 rsvd) (setf (aref b 16) nfats)
+        (setf (aref b 21) #xF8)                     ; media: fixed disk
+        (le b 24 2 63) (le b 26 2 255)              ; sectors per track, heads (nominal)
+        (le b 28 4 hidden-sectors) (le b 32 4 total)
+        (le b 36 4 fatsz) (le b 44 4 2)             ; FAT size; root at cluster 2
+        (le b 48 2 1) (le b 50 2 6)                 ; FSInfo at 1, backup boot sector at 6
+        (setf (aref b 64) #x80 (aref b 66) #x29)    ; drive number; extended boot signature
+        (le b 67 4 volume-id)
+        (ascii b 71 (or label "NO NAME") 11)
+        (ascii b 82 "FAT32" 8)
+        (setf (aref b 510) #x55 (aref b 511) #xAA)
+        (put 6 b)
+        (device-flush dev)
+        (put 0 b))
+      (device-flush dev)
+      (fat32-open-device dev))))
