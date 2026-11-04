@@ -185,7 +185,7 @@
         (capacity (* (length clusters) (%fat-cluster-bytes v))))
     (when (> size capacity)
       (error "fat32: chain holds ~a bytes, ~a expected" capacity size))
-    (let ((out (make-array size))
+    (let ((out (make-array size :element-type (quote (unsigned-byte 8))))
           (pos 0))
       (dolist (c clusters)
         (let ((data (%fat-read v (%fat-cluster-offset v c) cs)))

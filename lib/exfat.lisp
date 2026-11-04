@@ -135,7 +135,7 @@
          (capacity (* (length clusters) cs)))
     (when (> size capacity)
       (error "exfat: chain holds ~a bytes, ~a expected" capacity size))
-    (let ((out (make-array size))
+    (let ((out (make-array size :element-type (quote (unsigned-byte 8))))
           (pos 0))
       (dolist (c clusters)
         (let ((data (%ex-read v (%ex-cluster-off v c) cs)))
