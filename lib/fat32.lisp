@@ -48,7 +48,7 @@
 (defpackage #:fs-fat
   (:use #:cl)
   (:export #:fat32-open #:fat32-open-device #:fat32-lookup #:fat32-directory
-           #:fat32-read-file #:fat32-write-file #:fat32-mkdir #:fat32-delete
+           #:fat32-read-file #:fat32-write-file #:fat32-write-file-from #:fat32-mkdir #:fat32-delete
            #:fat32-rename #:fat32-sync #:fat32-format
            #:make-fat32-device #:make-fat32-block-device #:device-size
            #:device-read #:device-write #:device-flush
@@ -944,6 +944,59 @@
             (%fat-free-clusters v chain)))
         (when old
           (%fat-barrier v)                      ; the new entry before the old chain goes
+          (%fat-free-chain v (nth 3 old)))
+        nil))))
+
+(defun fat32-write-file-from (v path n next)
+  "Create the file at PATH holding N bytes, taken in order from NEXT -- a function returning
+   the next octet vector, or NIL when there are no more -- or replace the contents of the file
+   there.  The file is never in memory at once: each chunk is written to its clusters as it
+   arrives.  Like FAT32-WRITE-FILE, the data is durable before the entry points at it, and the
+   chunks must add up to exactly N."
+  (multiple-value-bind (parent base) (%fat-resolve-parent v path)
+    (%fat-check-name base)
+    (multiple-value-bind (entries raw clusters) (%fat-scan-dir v parent)
+      (declare (ignore raw))
+      (let* ((old (%fat-find entries base))
+             (cs (%fat-cluster-bytes v))
+             (bps (%fat-bps v))
+             (chain nil)
+             (done nil))
+        (when (and old (nth 1 old))
+          (error "fat32: ~s is a directory" path))
+        (setq chain (%fat-alloc-chain v (ceiling n cs)))
+        (unwind-protect
+             (let ((chunk (make-array 0 :element-type '(unsigned-byte 8))) (ci 0) (pos 0))
+               (dolist (c chain)
+                 (let ((off (%fat-cluster-offset v c)))
+                   (loop for k from 0 below cs by bps
+                         do (let ((buf (make-array bps :element-type '(unsigned-byte 8) :initial-element 0)))
+                              (dotimes (i bps)
+                                (when (< pos n)
+                                  (loop while (and chunk (>= ci (length chunk)))
+                                        do (setq chunk (funcall next) ci 0))
+                                  (unless chunk
+                                    (error "fat32: ~s: the data ended at byte ~d of ~d" path pos n))
+                                  (setf (aref buf i) (aref chunk ci))
+                                  (setq ci (+ ci 1) pos (+ pos 1))))
+                              (%fat-write v (+ off k) buf)))))
+               (when (or (and chunk (< ci (length chunk))) (funcall next))
+                 (error "fat32: ~s: more than ~d bytes of data" path n))
+               (%fat-barrier v)
+               (if old
+                   (let* ((off (%fat-slot-offset v clusters (nth 5 old)))
+                          (e (%fat-read v off 32))
+                          (head (if chain (car chain) 0)))
+                     (%fat-put e 20 2 (ash head -16))
+                     (%fat-put e 26 2 (logand head #xFFFF))
+                     (%fat-put e 28 4 n)
+                     (%fat-write v off e))
+                   (%fat-add-entry v parent base nil (if chain (car chain) 0) n))
+               (setq done t))
+          (unless done
+            (%fat-free-clusters v chain)))
+        (when old
+          (%fat-barrier v)
           (%fat-free-chain v (nth 3 old)))
         nil))))
 
