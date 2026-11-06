@@ -947,6 +947,31 @@
           (%fat-free-chain v (nth 3 old)))
         nil))))
 
+;;; One sector of FAT32-WRITE-FILE-FROM's data.  It is its own function, called once per
+;;; sector, so that an implementation which compiles a function after it has been called a few
+;;; times compiles this one early, rather than running a whole file's copy loop the way the
+;;; first call of FAT32-WRITE-FILE-FROM ran it.
+
+(defun %fat-take-sector (bps st next n path)
+  "A fresh BPS-byte sector holding the next bytes of the data, zero past byte N.  ST is the
+   vector (chunk index-in-chunk bytes-taken-so-far), advanced here."
+  (let* ((buf (make-array bps :element-type '(unsigned-byte 8) :initial-element 0))
+         (want (max 0 (min bps (- n (svref st 2)))))
+         (i 0))
+    (loop while (< i want)
+          do (let ((chunk (svref st 0)) (ci (svref st 1)))
+               (if (< ci (length chunk))
+                   (let ((k (min (- want i) (- (length chunk) ci))))
+                     (replace buf chunk :start1 i :start2 ci :end2 (+ ci k))
+                     (setf (svref st 1) (+ ci k))
+                     (setq i (+ i k)))
+                   (let ((more (funcall next)))
+                     (unless more
+                       (error "fat32: ~s: the data ended at byte ~d of ~d" path (+ (svref st 2) i) n))
+                     (setf (svref st 0) more (svref st 1) 0)))))
+    (setf (svref st 2) (+ (svref st 2) want))
+    buf))
+
 (defun fat32-write-file-from (v path n next)
   "Create the file at PATH holding N bytes, taken in order from NEXT -- a function returning
    the next octet vector, or NIL when there are no more -- or replace the contents of the file
@@ -966,21 +991,12 @@
           (error "fat32: ~s is a directory" path))
         (setq chain (%fat-alloc-chain v (ceiling n cs)))
         (unwind-protect
-             (let ((chunk (make-array 0 :element-type '(unsigned-byte 8))) (ci 0) (pos 0))
+             (let ((st (vector (make-array 0 :element-type '(unsigned-byte 8)) 0 0)))
                (dolist (c chain)
                  (let ((off (%fat-cluster-offset v c)))
                    (loop for k from 0 below cs by bps
-                         do (let ((buf (make-array bps :element-type '(unsigned-byte 8) :initial-element 0)))
-                              (dotimes (i bps)
-                                (when (< pos n)
-                                  (loop while (and chunk (>= ci (length chunk)))
-                                        do (setq chunk (funcall next) ci 0))
-                                  (unless chunk
-                                    (error "fat32: ~s: the data ended at byte ~d of ~d" path pos n))
-                                  (setf (aref buf i) (aref chunk ci))
-                                  (setq ci (+ ci 1) pos (+ pos 1))))
-                              (%fat-write v (+ off k) buf)))))
-               (when (or (and chunk (< ci (length chunk))) (funcall next))
+                         do (%fat-write v (+ off k) (%fat-take-sector bps st next n path)))))
+               (when (or (< (svref st 1) (length (svref st 0))) (funcall next))
                  (error "fat32: ~s: more than ~d bytes of data" path n))
                (%fat-barrier v)
                (if old
