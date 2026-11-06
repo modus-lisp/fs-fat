@@ -53,6 +53,21 @@ cat > "$W/t.lisp" <<LISP
                                   nil)
                (error () t))))
     (check (null (fat32-lookup v "/p/broken")))
+    ;; the push-style handle: two outputs open at once in one directory, another file written
+    ;; in it meanwhile, then one closed and one aborted
+    (let ((a (fat32-open-output v "/p/a.bin")) (b (fat32-open-output v "/p/b.bin"))
+          (chunk (subseq src 0 70001)))
+      (dotimes (i 30) (fat32-write-output a chunk :start (* i 13) :end (+ 60000 (* i 13)))
+                      (fat32-write-output b chunk :end 333))
+      (fat32-write-file v "/p/between.txt" (map '(vector (unsigned-byte 8)) #'char-code "written while two were open"))
+      (check (null (fat32-lookup v "/p/a.bin")))
+      (check (= (fat32-close-output a) (* 30 (- 60000 0))))
+      (fat32-close-output b :abort t)
+      (check (null (fat32-lookup v "/p/b.bin")))
+      (let ((got (fat32-read-file v "/p/a.bin")))
+        (check (= (length got) 1800000))
+        (check (loop for i below 30 always (equalp (subseq got (* i 60000) (* (1+ i) 60000))
+                                                   (subseq chunk (* i 13) (+ 60000 (* i 13))))))))
     (fat32-sync v)
     (close s)
     (sb-ext:exit :code *bad*)))
@@ -62,4 +77,6 @@ out=$(sbcl --noinform --non-interactive --load "$W/t.lisp" 2>&1); rc=$?; printf 
 mcopy -o -i "$W/img" ::/p/big.bin "$W/out.bin" && cmp -s "$W/data.bin" "$W/out.bin" || { echo "FAIL: big.bin differs"; exit 1; }
 mcopy -o -i "$W/img" ::/p/small.txt "$W/small" && [ "$(wc -c < "$W/small")" = 5000 ] && [ "$(tr -d A < "$W/small" | wc -c)" = 0 ] || { echo "FAIL: small.txt"; exit 1; }
 /sbin/fsck.fat -n "$W/img" >/dev/null || { echo "FAIL: fsck.fat"; /sbin/fsck.fat -n "$W/img" | tail -5; exit 1; }
+mcopy -o -i "$W/img" ::/p/between.txt "$W/between" && [ "$(cat "$W/between")" = "written while two were open" ] || { echo "FAIL: between.txt"; exit 1; }
+[ "$(mdir -b -i "$W/img" ::/p/ 2>/dev/null | grep -c 'a.bin')" = 1 ] || { echo "FAIL: a.bin entry"; exit 1; }
 echo "PASS run-fat32-streamio"

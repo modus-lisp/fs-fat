@@ -49,7 +49,8 @@
   (:use #:cl)
   (:export #:fat32-open #:fat32-open-device #:fat32-lookup #:fat32-directory
            #:fat32-read-file #:fat32-write-file #:fat32-write-file-from #:fat32-mkdir #:fat32-delete
-           #:fat32-write-file-stream #:fat32-open-input #:fat32-input-size #:fat32-read-into
+           #:fat32-write-file-stream #:fat32-open-output #:fat32-write-output #:fat32-close-output
+           #:fat32-open-input #:fat32-input-size #:fat32-read-into
            #:fat32-rename #:fat32-sync #:fat32-format
            #:make-fat32-device #:make-fat32-block-device #:device-size
            #:device-read #:device-write #:device-flush
@@ -1028,70 +1029,90 @@
 ;;; read back a window at a time.  FAT32-WRITE-FILE-STREAM claims clusters as the data comes;
 ;;; FAT32-OPEN-INPUT and FAT32-READ-INTO read any byte range of a file into the caller's buffer.
 
-(defun %fat-fill-sector (buf st next)
-  "Fill BUF from the chunks NEXT returns.  ST is (chunk index-in-chunk bytes-so-far chunk-end),
-   advanced here.  Returns how many bytes went in, fewer than BUF's length only when the data
-   has ended; the rest of BUF is zeroed."
-  (let ((i 0) (want (length buf)))
-    (loop while (< i want)
-          do (let ((chunk (svref st 0)) (ci (svref st 1)) (ce (svref st 3)))
-               (if (< ci ce)
-                   (let ((k (min (- want i) (- ce ci))))
-                     (replace buf chunk :start1 i :start2 ci :end2 (+ ci k))
-                     (setf (svref st 1) (+ ci k))
-                     (setq i (+ i k)))
-                   (multiple-value-bind (more more-end) (funcall next)
-                     (unless more (return))
-                     (setf (svref st 0) more (svref st 1) 0
-                           (svref st 3) (or more-end (length more)))))))
-    (when (< i want) (fill buf 0 :start i))
-    (setf (svref st 2) (+ (svref st 2) i))
-    i))
+(defun fat32-open-output (v path)
+  "Begin writing the file at PATH (creating it, or replacing the contents of the file there)
+   a piece at a time: FAT32-WRITE-OUTPUT appends, FAT32-CLOSE-OUTPUT finishes.  Clusters are
+   claimed as the data arrives, so the length need not be known and nothing but one sector is
+   held here.  Until the close the file at PATH is untouched; the data is durable before the
+   entry points at it."
+  (multiple-value-bind (parent base) (%fat-resolve-parent v path)
+    (%fat-check-name base)
+    (let ((old (%fat-find (%fat-scan-dir v parent) base)))
+      (when (and old (nth 1 old))
+        (error "fat32: ~s is a directory" path)))
+    ;; #(V PARENT BASE PATH CHAIN K SECTOR FILL TOTAL OPEN)
+    (vector v parent base path nil 0
+            (make-array (%fat-bps v) :element-type '(unsigned-byte 8)) 0 0 t)))
+
+(defun %fat-output-sector (h)
+  "Write H's sector buffer as the next sector of the file, claiming a cluster when one starts."
+  (let* ((v (svref h 0)) (k (svref h 5)) (sector (svref h 6)))
+    (when (zerop k)
+      (let ((c (%fat-alloc v)))
+        (when (svref h 4) (%fat-set-next v (car (svref h 4)) c))
+        (push c (svref h 4))))
+    (%fat-write v (+ (%fat-cluster-offset v (car (svref h 4))) (* k (%fat-bps v))) (copy-seq sector))
+    (setf (svref h 5) (mod (+ k 1) (%fat-spc v))
+          (svref h 7) 0)))
+
+(defun fat32-write-output (h buf &key (start 0) (end (length buf)))
+  "Append BUF[START..END) to the file open as H."
+  (unless (svref h 9) (error "fat32: ~s is not open for writing" (svref h 3)))
+  (let ((sector (svref h 6)) (i start))
+    (loop while (< i end)
+          do (let* ((fill (svref h 7))
+                    (n (min (- end i) (- (length sector) fill))))
+               (replace sector buf :start1 fill :start2 i :end2 (+ i n))
+               (setf (svref h 7) (+ fill n))
+               (incf i n)
+               (when (= (svref h 7) (length sector)) (%fat-output-sector h))))
+    (setf (svref h 8) (+ (svref h 8) (- end start)))
+    h))
+
+(defun fat32-close-output (h &key abort)
+  "Finish the file open as H and return its length: its entry at the path now names the data
+   written.  With ABORT, or if finishing fails, the data is released and the path is left as it
+   was."
+  (when (svref h 9)
+    (setf (svref h 9) nil)
+    (let ((v (svref h 0)) (done nil))
+      (unwind-protect
+           (unless abort
+             (when (plusp (svref h 7))
+               (fill (svref h 6) 0 :start (svref h 7))
+               (%fat-output-sector h))
+             (let ((chain (reverse (svref h 4))))
+               (%fat-barrier v)
+               ;; the directory is read again here, not at the open: other files may have been
+               ;; written in it meanwhile
+               (multiple-value-bind (entries raw clusters) (%fat-scan-dir v (svref h 1))
+                 (declare (ignore raw))
+                 (let ((old (%fat-find entries (svref h 2))))
+                   (%fat-point-entry v (svref h 1) clusters old (svref h 2)
+                                     (if chain (car chain) 0) (svref h 8))
+                   (setq done t)
+                   (when old
+                     (%fat-barrier v)
+                     (%fat-free-chain v (nth 3 old)))))))
+        (unless done
+          (%fat-free-clusters v (svref h 4))))))
+  (svref h 8))
 
 (defun fat32-write-file-stream (v path next)
   "Create the file at PATH, or replace the contents of the one there, with the data NEXT yields:
    NEXT returns an octet vector, and optionally as a second value how many of its leading bytes
    to take, or NIL when the data has ended.  It may hand back the same vector every time, since
    each chunk is taken before NEXT is called again.  The length need not be known in advance
-   (FAT32-WRITE-FILE-FROM's must): clusters are claimed as the data arrives, so nothing but one
-   sector is ever held here.  The data is durable before the entry points at it.  Returns the
-   number of bytes written."
-  (multiple-value-bind (parent base) (%fat-resolve-parent v path)
-    (%fat-check-name base)
-    (multiple-value-bind (entries raw clusters) (%fat-scan-dir v parent)
-      (declare (ignore raw))
-      (let* ((old (%fat-find entries base))
-             (bps (%fat-bps v))
-             (spc (%fat-spc v))
-             (st (vector (make-array 0 :element-type '(unsigned-byte 8)) 0 0 0))
-             (chain nil)
-             (k 0)
-             (done nil))
-        (when (and old (nth 1 old))
-          (error "fat32: ~s is a directory" path))
-        (unwind-protect
-             (progn
-               (loop
-                 (let* ((buf (make-array bps :element-type '(unsigned-byte 8)))
-                        (got (%fat-fill-sector buf st next)))
-                   (when (zerop got) (return))
-                   (when (zerop k)
-                     (let ((c (%fat-alloc v)))
-                       (when chain (%fat-set-next v (car chain) c))
-                       (push c chain)))
-                   (%fat-write v (+ (%fat-cluster-offset v (car chain)) (* k bps)) buf)
-                   (setq k (mod (+ k 1) spc))
-                   (when (< got bps) (return))))
-               (setq chain (nreverse chain))
-               (%fat-barrier v)
-               (%fat-point-entry v parent clusters old base (if chain (car chain) 0) (svref st 2))
-               (setq done t))
-          (unless done
-            (%fat-free-clusters v chain)))
-        (when old
-          (%fat-barrier v)
-          (%fat-free-chain v (nth 3 old)))
-        (svref st 2)))))
+   (FAT32-WRITE-FILE-FROM's must).  FAT32-OPEN-OUTPUT is the same for a writer that is handed
+   its data rather than asking for it.  Returns the number of bytes written."
+  (let ((h (fat32-open-output v path)) (ok nil))
+    (unwind-protect
+         (progn
+           (loop (multiple-value-bind (more more-end) (funcall next)
+                   (unless more (return))
+                   (fat32-write-output h more :end (or more-end (length more)))))
+           (prog1 (fat32-close-output h) (setq ok t)))
+      (unless ok (fat32-close-output h :abort t)))))
 
 (defun fat32-open-input (v path)
   "A handle for reading the file at PATH a piece at a time with FAT32-READ-INTO, or NIL when
