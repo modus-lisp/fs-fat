@@ -1,6 +1,6 @@
 # fs-fat
 
-FAT32 and exFAT readers and writers in pure Common Lisp. No FFI, no mounting, no
+FAT12, FAT16, FAT32 and exFAT readers and writers in pure Common Lisp. No FFI, no mounting, no
 root: a volume is a byte vector, or a device you supply. The package is `FS-FAT`.
 
 ```lisp
@@ -29,6 +29,14 @@ shape with `exfat-open`, `exfat-read-file`, `exfat-write-file`, and so on.
 | `fat32-write-file v path bytes` | writes (creating or replacing) a file |
 | `fat32-mkdir`, `fat32-delete`, `fat32-rename` | directory and name operations |
 | `fat32-sync v` | a write barrier: everything written so far is durable before anything after it |
+| `fat-open bytes &optional device` | a volume of any FAT width (12, 16 or 32); every `fat32-*` operation takes it |
+| `fat-type v` | 12, 16 or 32 |
+| `fat-format-floppy dev &key label volume-id` | an empty FAT12 floppy (720 KB, 1.44 MB or 2.88 MB, DOS's geometry) |
+
+FAT12 and FAT16 (floppies are FAT12) differ in three places, all inside the
+library: the root directory is a fixed region that cannot grow (writing past its
+entry count is an error), FAT entries are 12 or 16 bits, and there is no FSInfo.
+`test/run-fat12.sh` checks both against mtools, mkfs.vfat and fsck.fat.
 
 Paths are `/`-separated; `""` and `"/"` name the root. An entry is
 `(NAME DIRP SIZE FIRST-CLUSTER)`. Lookup is case-insensitive, as FAT is.

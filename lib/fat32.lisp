@@ -12,8 +12,14 @@
 ;;;; for OEM code-page 437 characters above 127.  LFN code units become chars
 ;;;; directly; surrogate pairs are not combined.
 ;;;;
-;;;; Not here yet: FAT12/16, exFAT, and a sector-reading seam for block devices
-;;;; (the library needs the whole volume in memory).
+;;;; FAT12 AND FAT16 (FAT-OPEN; floppies are FAT12): the same volume and every
+;;;; FAT32-* operation, with three differences kept to the edges -- the root is a
+;;;; fixed region after the FATs, not a cluster chain (here its sectors are
+;;;; PSEUDO-CLUSTERS -1, -2, ...: every directory routine walks a list of
+;;;; clusters, and only %FAT-CLUSTER-OFFSET and %FAT-CHAIN-UNIT know); FAT
+;;;; entries are 12 bits (two in three bytes) or 16, read and written as FAT32
+;;;; values (#x0FFFFFFF end of chain, #x0FFFFFF7 bad); and there is no FSInfo.
+;;;; The fixed root cannot grow.  FAT-FORMAT-FLOPPY makes an empty FAT12 floppy.
 ;;;;
 ;;;; Public API (reading):
 ;;;;   (fat32-open bytes)          -> volume.  An ERROR if BYTES is not FAT32.
@@ -47,7 +53,8 @@
 ;;;; to it, and the test harnesses reach them as FS-FAT::%NAME.
 (defpackage #:fs-fat
   (:use #:cl)
-  (:export #:fat32-open #:fat32-open-device #:fat32-lookup #:fat32-directory
+  (:export #:fat-open #:fat-format-floppy #:fat-type
+           #:fat32-open #:fat32-open-device #:fat32-lookup #:fat32-directory
            #:fat32-read-file #:fat32-write-file #:fat32-write-file-from #:fat32-mkdir #:fat32-delete
            #:fat32-write-file-stream #:fat32-open-output #:fat32-write-output #:fat32-close-output
            #:fat32-open-input #:fat32-input-size #:fat32-read-into
@@ -62,7 +69,7 @@
 (in-package #:fs-fat)
 
 ;; Used before their definitions below, so a source LOAD does not warn about them.
-(declaim (ftype function device-read device-size %fat-copy-into))
+(declaim (ftype function device-read device-size %fat-copy-into fat32-open %fat16-open))
 
 (defun %fat-u8 (bytes off)
   (when (or (< off 0) (>= off (length bytes)))
@@ -80,8 +87,11 @@
 
 ;;; ---- volume ------------------------------------------------------------------
 ;;; A volume is the list (BYTES BPS SPC FAT-START DATA-START ROOT-CLUSTER NCLUSTERS
-;;; NFATS FATSZ FSINFO DEVICE).  FAT-START, DATA-START, FATSZ (one FAT copy) and
-;;; FSINFO (the FSInfo sector, or NIL) are byte offsets.  DEVICE is NIL or a device.
+;;; NFATS FATSZ FSINFO DEVICE [TYPE ROOT-START ROOT-SECTORS]).  FAT-START,
+;;; DATA-START, FATSZ (one FAT copy) and FSINFO (the FSInfo sector, or NIL) are
+;;; byte offsets.  DEVICE is NIL or a device.  TYPE is 12, 16 or 32 (absent: 32);
+;;; a FAT12/16 volume's ROOT-CLUSTER is -1, the first sector of its fixed root,
+;;; which is ROOT-SECTORS sectors from byte ROOT-START.
 
 (defun %fat-bytes (v) (nth 0 v))
 (defun %fat-bps (v) (nth 1 v))
@@ -94,11 +104,21 @@
 (defun %fat-fatsz (v) (nth 8 v))
 (defun %fat-fsinfo (v) (nth 9 v))
 (defun %fat-device (v) (nth 10 v))
+(defun fat-type (v) "12, 16 or 32." (or (nth 11 v) 32))
+(defun %fat-root-start (v) (nth 12 v))
+(defun %fat-root-sectors (v) (nth 13 v))
 
 (defun %fat-cluster-bytes (v) (* (%fat-bps v) (%fat-spc v)))
 
 (defun %fat-cluster-offset (v c)
-  (+ (%fat-data-start v) (* (- c 2) (%fat-cluster-bytes v))))
+  "Cluster C's byte offset; a pseudo-cluster -K is the fixed root's Kth sector."
+  (if (< c 0)
+      (+ (%fat-root-start v) (* (- -1 c) (%fat-bps v)))
+      (+ (%fat-data-start v) (* (- c 2) (%fat-cluster-bytes v)))))
+
+(defun %fat-chain-unit (v clusters)
+  "The bytes each of CLUSTERS holds: a sector for the fixed root's, else a cluster."
+  (if (and clusters (< (car clusters) 0)) (%fat-bps v) (%fat-cluster-bytes v)))
 
 (defun %fat-read (v off n)
   "N bytes at OFF, as a fresh vector.  Reads go through the device when there is one,
@@ -112,8 +132,59 @@
   (%fat-le (%fat-read v off n) 0 n))
 
 (defun %fat-next (v c)
-  "The FAT entry for cluster C: the next cluster, or an end or bad marker."
-  (logand (%fat-read-le v (+ (%fat-fat-start v) (* c 4)) 4) #x0FFFFFFF))
+  "The FAT entry for cluster C: the next cluster, or an end or bad marker, as
+   FAT32 spells them (a FAT12/16 entry's top values widened)."
+  (case (fat-type v)
+    (32 (logand (%fat-read-le v (+ (%fat-fat-start v) (* c 4)) 4) #x0FFFFFFF))
+    (16 (let ((e (%fat-read-le v (+ (%fat-fat-start v) (* c 2)) 2)))
+          (if (>= e #xFFF7) (+ e #x0FFF0000) e)))
+    (t (let* ((w (%fat-read-le v (+ (%fat-fat-start v) (floor (* 3 c) 2)) 2))
+              (e (if (evenp c) (logand w #xFFF) (ash w -4))))
+         (if (>= e #xFF7) (+ e #x0FFFF000) e)))))
+
+(defun fat-open (bytes &optional device)
+  "A volume over BYTES, FAT12, FAT16 or FAT32 (see FAT32-OPEN for DEVICE); the
+   FAT32-* operations work on it."
+  (let ((len (if device (device-size device) (length bytes))))
+    (when (< len 512)
+      (error "fat: volume is ~a bytes, too short for a boot sector" len))
+    (if (and (= (%fat-le bytes 17 2) 0) (= (%fat-le bytes 22 2) 0))
+        (fat32-open bytes device)
+        (%fat16-open bytes device len))))
+
+(defun %fat16-open (bytes device len)
+  "FAT-OPEN of a FAT12 or FAT16 volume: a root entry count and FATSz16 in the BPB."
+  (unless (and (= (%fat-u8 bytes 510) #x55) (= (%fat-u8 bytes 511) #xAA))
+    (error "fat: no boot sector signature"))
+  (let* ((bps (%fat-le bytes 11 2))
+         (spc (%fat-u8 bytes 13))
+         (rsvd (%fat-le bytes 14 2))
+         (nfats (%fat-u8 bytes 16))
+         (rootent (%fat-le bytes 17 2))
+         (tot16 (%fat-le bytes 19 2))
+         (fatsz (%fat-le bytes 22 2))
+         (total (if (= tot16 0) (%fat-le bytes 32 4) tot16)))
+    (unless (or (= bps 512) (= bps 1024) (= bps 2048) (= bps 4096))
+      (error "fat: bytes per sector ~a is not 512, 1024, 2048 or 4096" bps))
+    (unless (and (> spc 0) (<= spc 128) (= 0 (logand spc (- spc 1))))
+      (error "fat: sectors per cluster ~a is not a power of two up to 128" spc))
+    (unless (and (> fatsz 0) (> rsvd 0) (>= nfats 1) (> rootent 0))
+      (error "fat: reserved sectors, FAT count, FAT size or root entries is zero"))
+    (let* ((root-sectors (ceiling (* rootent 32) bps))
+           (root-start (* (+ rsvd (* nfats fatsz)) bps))
+           (data (+ rsvd (* nfats fatsz) root-sectors))
+           (nclusters (floor (max 0 (- total data)) spc))
+           (type (if (< nclusters 4085) 12 16)))
+      (when (> (* total bps) len)
+        (error "fat: volume declares ~a bytes but only ~a are present" (* total bps) len))
+      (when (< nclusters 1)
+        (error "fat: no data clusters"))
+      (when (>= nclusters 65525)
+        (error "fat: ~a clusters with a FAT16 BPB -- that is FAT32's size" nclusters))
+      (when (< (* fatsz bps) (ceiling (* (if (= type 12) 3 4) (+ nclusters 2)) 2))
+        (error "fat: FAT is too small for ~a clusters" nclusters))
+      (list bytes bps spc (* rsvd bps) (* data bps) -1 nclusters nfats (* fatsz bps)
+            nil device type root-start root-sectors))))
 
 (defun fat32-open (bytes &optional device)
   "A volume over BYTES.  DEVICE, when given, is the disk BYTES is the view of: writes
@@ -165,7 +236,11 @@
 
 (defun %fat-chain (v first)
   "The clusters of the chain starting at FIRST, in order.  A FIRST below 2 is an
-   empty chain (an empty file)."
+   empty chain (an empty file) -- but -1, a FAT12/16 volume's fixed root, is its
+   sectors' pseudo-clusters, -1 down."
+  (when (and (= first -1) (/= (fat-type v) 32))
+    (return-from %fat-chain
+      (loop for k from 1 to (%fat-root-sectors v) collect (- k))))
   (let ((acc nil) (c first) (n 0) (limit (%fat-nclusters v)))
     (when (>= c 2)
       (loop
@@ -183,8 +258,8 @@
   "Fresh vector holding the first SIZE bytes of the clusters CLUSTERS.  SIZE is
    checked against the chain's capacity before anything is allocated: a size
    field taken from a corrupt directory entry can ask for gigabytes."
-  (let ((cs (%fat-cluster-bytes v))
-        (capacity (* (length clusters) (%fat-cluster-bytes v))))
+  (let* ((cs (%fat-chain-unit v clusters))
+         (capacity (* (length clusters) cs)))
     (when (> size capacity)
       (error "fat32: chain holds ~a bytes, ~a expected" capacity size))
     (let ((out (make-array size :element-type (quote (unsigned-byte 8))))
@@ -353,7 +428,7 @@
    name.  Slot numbers index 32-byte entries in RAW, which is the directory's
    bytes in chain order.  \".\" and \"..\" are skipped."
   (let* ((clusters (%fat-chain v cluster))
-         (raw (%fat-read-clusters v clusters (* (length clusters) (%fat-cluster-bytes v))))
+         (raw (%fat-read-clusters v clusters (* (length clusters) (%fat-chain-unit v clusters))))
          (nslots (floor (length raw) 32))
          (out nil)
          (lfn nil)          ; LFN pieces of the run being read
@@ -382,7 +457,8 @@
                   (use-lfn (and lfn (= lfn-sum (%fat-sfn-checksum raw off))))
                   (name (if use-lfn (%utf16-decode (%fat-lfn-join lfn)) short))
                   (dirp (/= 0 (logand attr #x10)))
-                  (cluster (+ (* 65536 (%fat-le raw (+ off 20) 2)) (%fat-le raw (+ off 26) 2)))
+                  (cluster (+ (if (= (fat-type v) 32) (* 65536 (%fat-le raw (+ off 20) 2)) 0)
+                              (%fat-le raw (+ off 26) 2)))
                   (size (%fat-le raw (+ off 28) 4)))
              (push (list name dirp (if dirp 0 size) cluster
                          (if use-lfn lfn-first i) i (subseq raw off (+ off 11)))
@@ -618,7 +694,25 @@
 
 (defun %fat-set-next (v c value)
   "Write FAT entry C to VALUE in every FAT copy, keeping the reserved top nibble.
-   Each copy is its own sector write, in copy order."
+   Each copy is its own sector write, in copy order.  FAT12/16: VALUE as FAT32
+   spells it, narrowed; a FAT12 entry that straddles a sector is two writes."
+  (unless (= (fat-type v) 32)
+    (dotimes (i (%fat-nfats v))
+      (let ((base (+ (%fat-fat-start v) (* i (%fat-fatsz v)))))
+        (if (= (fat-type v) 16)
+            (%fat-write v (+ base (* c 2)) (%fat-le-bytes (logand value #xFFFF) 2))
+            (let* ((off (+ base (floor (* 3 c) 2)))
+                   (w (%fat-read-le v off 2))
+                   (e (logand value #xFFF))
+                   (new (if (evenp c)
+                            (logior (logand w #xF000) e)
+                            (logior (logand w #x000F) (ash e 4))))
+                   (b (%fat-le-bytes new 2)))
+              (if (= (floor off (%fat-bps v)) (floor (+ off 1) (%fat-bps v)))
+                  (%fat-write v off b)
+                  (progn (%fat-write v off (subseq b 0 1))
+                         (%fat-write v (+ off 1) (subseq b 1 2))))))))
+    (return-from %fat-set-next nil))
   (dotimes (i (%fat-nfats v))
     (let* ((off (+ (%fat-fat-start v) (* i (%fat-fatsz v)) (* c 4)))
            (old (%fat-read-le v off 4)))
@@ -710,7 +804,7 @@
 
 (defun %fat-slot-offset (v clusters i)
   "Byte offset of directory slot I (32 bytes) in the chain CLUSTERS."
-  (let* ((cs (%fat-cluster-bytes v))
+  (let* ((cs (%fat-chain-unit v clusters))
          (pos (* 32 i)))
     (+ (%fat-cluster-offset v (nth (floor pos cs) clusters)) (mod pos cs))))
 
@@ -731,6 +825,8 @@
 
 (defun %fat-extend-dir (v clusters)
   "Give a directory one more zeroed cluster at its end.  Returns the new chain."
+  (when (< (car clusters) 0)
+    (error "fat: the root directory is full (a FAT12/16 root has a fixed size)"))
   (let ((c (car (%fat-alloc-chain v 1))))
     (%fat-zero-cluster v c)
     (%fat-barrier v)                    ; zeroed before it is linked
@@ -1330,3 +1426,51 @@
         (put 0 b))
       (device-flush dev)
       (fat32-open-device dev))))
+
+;;; ---- an empty FAT12 floppy ------------------------------------------------------------
+
+(defun fat-format-floppy (dev &key (label "NO NAME") (volume-id 0))
+  "Make DEV (a device of 720 KB, 1.44 MB or 2.88 MB) an empty FAT12 floppy, as DOS
+   formats one -- the geometry is the size's standard one -- and return the open
+   volume.  LABEL is up to 11 characters."
+  (let* ((size (device-size dev))
+         (g (or (cdr (assoc size '((737280 2 112 3 #xF9 9)
+                                   (1474560 1 224 9 #xF0 18)
+                                   (2949120 2 240 9 #xF0 36))))
+                (error "fat-format-floppy: ~a bytes is not a 720 KB, 1.44 MB or 2.88 MB floppy" size)))
+         (bps 512) (spc (first g)) (rootent (second g)) (fatsz (third g)) (media (fourth g))
+         (spt (fifth g)) (rsvd 1) (nfats 2)
+         (total (floor size bps))
+         (root-sectors (ceiling (* rootent 32) bps))
+         (zero (make-array bps :initial-element 0)))
+    (flet ((put (sector bytes) (device-write dev (* sector bps) bytes))
+           (le (bytes off n value) (%fat-put bytes off n value))
+           (ascii (bytes off string n)
+             (dotimes (i n)
+               (setf (aref bytes (+ off i))
+                     (if (< i (length string)) (char-code (char-upcase (char string i))) 32)))))
+      ;; both FATs and the root: zeros, then FAT[0] the media byte and FAT[1] end of chain
+      (dotimes (s (+ (* nfats fatsz) root-sectors)) (put (+ rsvd s) zero))
+      (let ((f (make-array bps :initial-element 0)))
+        (setf (aref f 0) media (aref f 1) #xFF (aref f 2) #xFF)
+        (dotimes (i nfats) (put (+ rsvd (* i fatsz)) f)))
+      (when (and label (string/= label "NO NAME"))
+        (let ((d (make-array bps :initial-element 0)))
+          (ascii d 0 label 11)
+          (setf (aref d 11) #x08)
+          (put (+ rsvd (* nfats fatsz)) d)))
+      (device-flush dev)
+      (let ((b (make-array bps :initial-element 0)))
+        (setf (aref b 0) #xEB (aref b 1) #x3C (aref b 2) #x90)
+        (ascii b 3 "MODUS" 8)
+        (le b 11 2 bps) (setf (aref b 13) spc) (le b 14 2 rsvd) (setf (aref b 16) nfats)
+        (le b 17 2 rootent) (le b 19 2 total) (setf (aref b 21) media) (le b 22 2 fatsz)
+        (le b 24 2 spt) (le b 26 2 2)               ; sectors per track, two heads
+        (setf (aref b 38) #x29)                     ; extended boot signature (drive 0)
+        (le b 39 4 volume-id)
+        (ascii b 43 (or label "NO NAME") 11)
+        (ascii b 54 "FAT12" 8)
+        (setf (aref b 510) #x55 (aref b 511) #xAA)
+        (put 0 b))
+      (device-flush dev)
+      (fat-open (device-read dev 0 bps) dev))))
