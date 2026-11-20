@@ -329,8 +329,15 @@
   (if (< c 65536) (aref *fat-upcase* c) c))
 
 (defun %fat-fold (ch)
-  "The up-case of CH as a code, for case-insensitive comparison."
-  (%fat-upcase-unit (char-code ch)))
+  "The up-case of CH as a code, for case-insensitive comparison.  ASCII directly
+   (the table maps a-z to A-Z and the rest of it to itself): the table is 65536
+   entries, decoded from 5836 hex pairs, and a name of plain ASCII -- every 8.3
+   name -- never needs it.  Measured on a 16 MHz 68030 (MAME's SE/30): building
+   it was seconds, and 256 KB of young heap every collection copied."
+  (let ((c (char-code ch)))
+    (if (< c 128)
+        (if (<= 97 c 122) (- c 32) c)
+        (%fat-upcase-unit c))))
 
 (defun %fat-name= (a b)
   (and (= (length a) (length b))
